@@ -14,9 +14,24 @@
  * `checkCwdMatch` API.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
+
+// Wrap child_process exports in spies that pass through to the real
+// implementation. Test setup (initRepoWithCommit, etc.) keeps working
+// against real git; individual tests can clear + assert call counts to
+// prove no subprocess was launched. Both module specifiers are mocked
+// because git-staleness.ts imports from 'node:child_process' while this
+// file (and storage/git.ts) import from 'child_process'.
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process');
+  return { ...actual, execSync: vi.fn(actual.execSync), execFileSync: vi.fn(actual.execFileSync) };
+});
+vi.mock('node:child_process', async () => {
+  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  return { ...actual, execSync: vi.fn(actual.execSync), execFileSync: vi.fn(actual.execFileSync) };
+});
 import {
   registerRepo,
   readRegistry,
@@ -233,6 +248,44 @@ describe('checkCwdMatch', () => {
     }
   });
 
+  it('returns match=none for a non-git cwd before resolving sibling remotes', async () => {
+    const indexed = await createTempDir('cwd-home-indexed-');
+    const nonGitCwd = await createTempDir('cwd-home-non-git-');
+    try {
+      const indexedHead = initRepoWithCommit(indexed.dbPath, 'https://example.com/foo/bar');
+      await registerRepo(indexed.dbPath, {
+        repoPath: indexed.dbPath,
+        lastCommit: indexedHead,
+        indexedAt: new Date().toISOString(),
+        remoteUrl: 'https://example.com/foo/bar',
+      });
+
+      // Clear after setup so we only count subprocess calls made by
+      // checkCwdMatch itself. The fix in #1138 must guarantee that no
+      // git subprocess is launched when the cwd is outside any .git
+      // ancestor — a return value of 'none' alone does not prove that
+      // (the pre-fix code also returned 'none', just by failing the
+      // spawn). The mocked module exports are vi.fn() wrappers that
+      // pass through to real implementations; clearing tracks only the
+      // calls made by checkCwdMatch below.
+      vi.mocked(execSync).mockClear();
+      vi.mocked(execFileSync).mockClear();
+      const nodeCp = await import('node:child_process');
+      vi.mocked(nodeCp.execSync).mockClear();
+      vi.mocked(nodeCp.execFileSync).mockClear();
+
+      const m = await checkCwdMatch(nonGitCwd.dbPath);
+      expect(m.match).toBe('none');
+      expect(execSync).not.toHaveBeenCalled();
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(nodeCp.execSync).not.toHaveBeenCalled();
+      expect(nodeCp.execFileSync).not.toHaveBeenCalled();
+    } finally {
+      await indexed.cleanup();
+      await nonGitCwd.cleanup();
+    }
+  });
+
   it('reports sibling-by-remote with a stale hint when cwd HEAD has advanced', async () => {
     // Polecat-style scenario from the issue: index at path A, query
     // from cwd=path B (same repo), get a warning rather than
@@ -305,4 +358,46 @@ describe('checkCwdMatch', () => {
       await sibling.cleanup();
     }
   });
+
+  it('handles root-level path roots (e.g. "/") in checkCwdMatch', async () => {
+    const rootPath = path.resolve('/');
+    await registerRepo(rootPath, {
+      repoPath: rootPath,
+      lastCommit: 'somecommit',
+      indexedAt: new Date().toISOString(),
+    });
+
+    // Exact match
+    const m1 = await checkCwdMatch(rootPath);
+    expect(m1.match).toBe('path');
+    expect(m1.entry?.path).toBe(rootPath);
+
+    // Nested path match
+    const nested = path.join(rootPath, 'src');
+    const m2 = await checkCwdMatch(nested);
+    expect(m2.match).toBe('path');
+    expect(m2.entry?.path).toBe(rootPath);
+  });
+
+  if (process.platform === 'win32') {
+    it('handles Windows drive-root (e.g. "C:\\") in checkCwdMatch', async () => {
+      const rootPath = 'C:\\';
+      await registerRepo(rootPath, {
+        repoPath: rootPath,
+        lastCommit: 'somecommit',
+        indexedAt: new Date().toISOString(),
+      });
+
+      // Exact match
+      const m1 = await checkCwdMatch(rootPath);
+      expect(m1.match).toBe('path');
+      expect(m1.entry?.path).toBe(rootPath);
+
+      // Nested path match
+      const nested = 'C:\\src';
+      const m2 = await checkCwdMatch(nested);
+      expect(m2.match).toBe('path');
+      expect(m2.entry?.path).toBe(rootPath);
+    });
+  }
 });

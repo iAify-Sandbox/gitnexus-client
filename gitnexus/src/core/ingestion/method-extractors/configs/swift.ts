@@ -1,5 +1,5 @@
 // gitnexus/src/core/ingestion/method-extractors/configs/swift.ts
-// Verified against tree-sitter-swift 0.6.0
+// Verified against tree-sitter-swift 0.7.x
 
 import { SupportedLanguages } from 'gitnexus-shared';
 import type {
@@ -110,7 +110,7 @@ function extractSwiftReturnType(node: SyntaxNode): string | undefined {
 function extractSwiftParameters(node: SyntaxNode): ParameterInfo[] {
   const params: ParameterInfo[] = [];
 
-  // In tree-sitter-swift 0.6.0, parameters are direct children of function_declaration.
+  // In tree-sitter-swift, parameters are direct children of function_declaration.
   // Default value tokens ('=', literal) are siblings of the parameter node at the
   // function_declaration level, not children of the parameter node.
   for (let i = 0; i < node.childCount; i++) {
@@ -264,17 +264,23 @@ function extractSwiftAnnotations(node: SyntaxNode): string[] {
 export const swiftMethodConfig: MethodExtractionConfig = {
   language: SupportedLanguages.Swift,
 
-  // tree-sitter-swift 0.6.0 may use class_declaration for classes, structs, enums, extensions,
-  // and actors — but this cannot be verified until the grammar installs on Node 22+.
-  // TODO: Verify struct_declaration, enum_declaration, extension_declaration, actor_declaration
-  // node types once tree-sitter-swift loads on Node 22, and add them here if they are distinct.
+  // tree-sitter-swift collapses class / struct / enum / extension / actor into a
+  // single `class_declaration` node (distinguished by the `declaration_kind`
+  // field) — verified by real parse. There is NO separate `enum_declaration`
+  // node type, so it must NOT be listed here (it would fail the grammar-drift
+  // gate). The enum's owner node is therefore already covered by
+  // `class_declaration`; F79 only needed the enum BODY node added below.
   // protocol_declaration is a separate, confirmed node type.
   typeDeclarationNodes: ['class_declaration', 'protocol_declaration'],
 
   // function_declaration for class/struct methods, protocol_function_declaration for protocol methods
   methodNodeTypes: ['function_declaration', 'protocol_function_declaration'],
 
-  bodyNodeTypes: ['class_body', 'protocol_body'],
+  // class_body for class/struct/extension/actor, protocol_body for protocols,
+  // enum_class_body for enums (F79). Without enum_class_body the factory only
+  // reached enum methods via the generic findBodies fallback, which logs a
+  // dev-mode "body field type not in bodyNodeTypes" warning.
+  bodyNodeTypes: ['class_body', 'protocol_body', 'enum_class_body'],
 
   extractName: extractSwiftName,
   extractReturnType: extractSwiftReturnType,

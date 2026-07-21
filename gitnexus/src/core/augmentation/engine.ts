@@ -2,8 +2,8 @@
  * Augmentation Engine
  *
  * Lightweight, fast-path enrichment of search patterns with knowledge graph context.
- * Designed to be called from platform hooks (Claude Code PreToolUse, Cursor beforeShellExecution)
- * when an agent runs grep/glob/search.
+ * Designed to be called from platform hooks (Claude Code PreToolUse, Cursor postToolUse)
+ * when an agent runs grep/glob/read/search.
  *
  * Performance target: <500ms cold start, <200ms warm.
  *
@@ -16,6 +16,7 @@
 
 import path from 'path';
 import { listRegisteredRepos } from '../../storage/repo-manager.js';
+import { escapeCypherString } from '../lbug/cypher-escape.js';
 
 /**
  * Find the best matching repo for a given working directory.
@@ -49,10 +50,14 @@ async function findRepoForCwd(cwd: string): Promise<{
       let matched = false;
       if (normalizedCwd === normalizedRepo) {
         matched = true;
-      } else if (normalizedCwd.startsWith(normalizedRepo + sep)) {
-        matched = true;
-      } else if (normalizedRepo.startsWith(normalizedCwd + sep)) {
-        matched = true;
+      } else {
+        const repoPrefix = normalizedRepo.endsWith(sep) ? normalizedRepo : normalizedRepo + sep;
+        const cwdPrefix = normalizedCwd.endsWith(sep) ? normalizedCwd : normalizedCwd + sep;
+        if (normalizedCwd.startsWith(repoPrefix)) {
+          matched = true;
+        } else if (normalizedRepo.startsWith(cwdPrefix)) {
+          matched = true;
+        }
       }
 
       if (matched && normalizedRepo.length > bestLen) {
@@ -86,6 +91,9 @@ async function findRepoForCwd(cwd: string): Promise<{
 export async function augment(pattern: string, cwd?: string): Promise<string> {
   if (!pattern || pattern.length < 3) return '';
 
+  const patternFirstWord = escapeCypherString(pattern.trim()).split(/\s+/)[0];
+  if (!patternFirstWord || patternFirstWord.length < 2) return '';
+
   const workDir = cwd || process.cwd();
 
   try {
@@ -104,9 +112,7 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
     }
 
     // Step 1: BM25 search (fast, no embeddings)
-    const bm25Results = await searchFTSFromLbug(pattern, 10, repoId);
-
-    if (bm25Results.length === 0) return '';
+    const { results: bm25Results, ftsAvailable } = await searchFTSFromLbug(pattern, 10, repoId);
 
     // Step 2: Map BM25 file results to symbols
     const symbolMatches: Array<{
@@ -118,13 +124,13 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
     }> = [];
 
     for (const result of bm25Results.slice(0, 5)) {
-      const escaped = result.filePath.replace(/'/g, "''");
+      const escaped = escapeCypherString(result.filePath);
       try {
         const symbols = await executeQuery(
           repoId,
           `
           MATCH (n) WHERE n.filePath = '${escaped}'
-          AND n.name CONTAINS '${pattern.replace(/'/g, "''").split(/\s+/)[0]}'
+          AND n.name CONTAINS '${patternFirstWord}'
           RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
           LIMIT 3
         `,
@@ -143,6 +149,29 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
       }
     }
 
+    // When FTS indexes are unavailable (read-only DB, first run before indexes are built),
+    // fall back to a direct name CONTAINS query so enrichment still works.
+    if (symbolMatches.length === 0 && !ftsAvailable) {
+      const fallbackRows = await executeQuery(
+        repoId,
+        `
+        MATCH (n)
+        WHERE n.name CONTAINS '${patternFirstWord}'
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        LIMIT 5
+      `,
+      ).catch(() => []);
+      for (const sym of fallbackRows) {
+        symbolMatches.push({
+          nodeId: sym.id || sym[0],
+          name: sym.name || sym[1],
+          type: sym.type || sym[2],
+          filePath: sym.filePath || sym[3],
+          score: 1.0,
+        });
+      }
+    }
+
     if (symbolMatches.length === 0) return '';
 
     // Step 3: Batch-fetch callers/callees/processes/cohesion for top matches
@@ -153,7 +182,7 @@ export async function augment(pattern: string, cwd?: string): Promise<string> {
 
     if (uniqueSymbols.length === 0) return '';
 
-    const idList = uniqueSymbols.map((s) => `'${s.nodeId.replace(/'/g, "''")}'`).join(', ');
+    const idList = uniqueSymbols.map((s) => `'${escapeCypherString(s.nodeId)}'`).join(', ');
 
     // Batch fetch callers
     const callersMap = new Map<string, string[]>();

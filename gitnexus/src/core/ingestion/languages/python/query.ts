@@ -1,12 +1,7 @@
 /**
  * Tree-sitter query for Python scope captures (RFC §5.1).
  *
- * The `.scm` sibling file is the human-readable spec; this module
- * mirrors it at runtime. **Edit both together** — the unit/integration
- * tests reference the embedded constant, and the file documents the
- * contract.
- *
- * Also exposes lazy `Parser` and `Query` singletons so callers don't
+ * Exposes lazy `Parser` and `Query` singletons so callers don't
  * pay tree-sitter init cost per file.
  */
 
@@ -18,6 +13,7 @@ const PYTHON_SCOPE_QUERY = `
 (module) @scope.module
 (class_definition) @scope.class
 (function_definition) @scope.function
+(lambda) @scope.function
 
 ;; Declarations
 (class_definition
@@ -238,6 +234,22 @@ const PYTHON_SCOPE_QUERY = `
 (function_definition
   name: (identifier) @type-binding.name
   return_type: (type) @type-binding.type) @type-binding.return
+
+;; Decorators — simple @decorator
+(decorator
+  (identifier) @reference.name) @reference.call.free
+
+;; Decorators — @obj.decorator (single attribute, identifier receiver)
+(decorator
+  (attribute
+    object: (identifier) @reference.receiver
+    attribute: (identifier) @reference.name)) @reference.call.member
+
+;; Decorators — @a.b.decorator (nested attributes)
+(decorator
+  (attribute
+    object: (attribute) @reference.receiver
+    attribute: (identifier) @reference.name)) @reference.call.member
 
 ;; References — calls
 (call

@@ -1,140 +1,177 @@
 /**
- * `WorkspaceResolutionIndex` — pre-computed lookup tables built ONCE
+ * `WorkspaceResolutionIndex` — scope-tied lookup tables built ONCE
  * per resolution run, after `populateOwners` and before any
  * resolution pass.
  *
- * Why: the resolution passes hammer the same lookup patterns
- * thousands of times per run. Without an index, every
- * `findOwnedMember` / `findExportedDef` / scope-by-defId lookup
- * walks `parsedFiles` linearly — O(N × D) per call, multiplied by
- * the (N × S × M) call count from the receiver-bound MRO chain.
- * One pre-built index turns those into O(1) `Map.get`.
+ * ## Scope (what lives here vs. what lives in `SemanticModel`)
  *
- * Build cost is one O(totalDefs) pass over `parsedFiles`. Pays for
- * itself on the very first MRO walk.
+ * This index carries only the lookups that return a `Scope` — things
+ * `SemanticModel` structurally cannot provide:
  *
- * The index is read-only after construction — passes that create
- * defs (e.g. provider.populateOwners) MUST run before the index is
- * built.
+ *   - `classScopeByDefId` — class def `nodeId` → `Scope`. Needed so
+ *     passes can read `scope.bindings`, `scope.typeBindings`, and
+ *     `scope.ownedDefs`. SemanticModel's `TypeRegistry` carries class
+ *     metadata but not the `Scope`.
+ *   - `classScopeIdToDefId` — inverse of `classScopeByDefId`. O(1)
+ *     reverse lookup (Scope.id → class def nodeId) for the implicit-
+ *     `this` overload picker.
+ *   - `moduleScopeByFile` — file path → `Scope` of the root `Module`.
+ *     Used by cross-file return-type propagation, `findExportedDef`,
+ *     and `findExportedDefByName`'s workspace-wide fallback.
+ *     SymbolTable indexes symbols, not scopes.
+ *
+ * Symbol lookups live on `SemanticModel`:
+ *   - Owner-keyed method lookup → `model.methods.lookupAllByOwner`
+ *     (populated by the legacy parse phase via `symbolTable.add` AND
+ *     by scope-resolution's reconciliation pass in `runScopeResolution`,
+ *     which adds `parsed.localDefs[i].ownerId` entries missed by the
+ *     legacy extractor for registry-primary languages).
+ *   - Name-keyed callable lookup → `model.methods.lookupMethodByName`
+ *     and `model.symbols.lookupCallableByName`.
+ *   - File-indexed symbol lookup → `model.symbols.lookupExactAll`.
+ *
+ * This split preserves the single-source-of-truth invariant
+ * documented in `ScopeResolver`'s contract file: symbol-indexed
+ * lookups live on `SemanticModel` for the whole codebase; only
+ * scope-shaped lookups (which `SemanticModel` doesn't carry) live
+ * here.
+ *
+ * Build cost is O(totalScopes). Read-only after construction.
  */
 
-import type { ParsedFile, Scope, SymbolDefinition } from 'gitnexus-shared';
-import { simpleQualifiedName } from './graph-bridge/ids.js';
+import type { ParsedFile, Scope, ScopeId, ScopeTree, SymbolDefinition } from 'gitnexus-shared';
+import { isClassLike } from './scope/walkers.js';
 
 export interface WorkspaceResolutionIndex {
   /** Class def `nodeId` → that class's `Scope`. */
   readonly classScopeByDefId: ReadonlyMap<string, Scope>;
 
-  /** Owner def `nodeId` → (simple-member-name → owned `SymbolDefinition`).
-   *  Replaces `findOwnedMember`'s O(N × D) walk with O(1) lookup.
-   *  Built from `parsed.localDefs` so class-owned members land in the
-   *  right bucket via their `ownerId`. */
-  readonly memberByOwner: ReadonlyMap<string, ReadonlyMap<string, SymbolDefinition>>;
+  /** Inverse of `classScopeByDefId`: class `Scope.id` → class def `nodeId`.
+   *  Built in the same pass; used by the implicit-`this` overload picker
+   *  in `free-call-fallback.ts` to skip an O(C) reverse scan. */
+  readonly classScopeIdToDefId: ReadonlyMap<ScopeId, string>;
 
-  /** File path → (simple-name → first matching module-scope-owned
-   *  `SymbolDefinition`). Backs `findExportedDef` — the lookup for
-   *  `from mod import X` / `mod.X()` targets. Only defs directly
-   *  owned by the file's `Module` scope are indexed here; methods,
-   *  fields, and nested-function defs are NOT visible as file-level
-   *  exports. First-seen-within-module wins. */
-  readonly defsByFileAndName: ReadonlyMap<string, ReadonlyMap<string, SymbolDefinition>>;
-
-  /** Workspace-wide simple-name fallback: simple-name → all matching
-   *  module-scope-owned Function/Method/Constructor defs. Backs the
-   *  `findExportedDefByName` fallback scan. Class methods and nested
-   *  functions are NOT eligible here — they are not import-visible
-   *  callables. */
-  readonly callablesBySimpleName: ReadonlyMap<string, readonly SymbolDefinition[]>;
-
-  /** Module scope by file path — used by cross-file return-type
-   *  propagation and by per-file imports lookup. */
+  /** Module scope by file path. */
   readonly moduleScopeByFile: ReadonlyMap<string, Scope>;
+
+  /** Precomputed `simpleName → first module-local callable def` (the
+   *  workspace-wide fallback of `findExportedDefByName`). Materialized here
+   *  ONCE from the resident module scopes so that fallback is an O(1) lookup
+   *  instead of an O(files) scan over every module scope's bindings on each
+   *  unresolved free call — which, under the disk-backed scopeTree, would
+   *  otherwise fault every module scope in from disk per call (the throughput
+   *  killer). "First module-local callable in `moduleScopeByFile` order" is the
+   *  exact semantics the old scan returned, so it is byte-identical. */
+  readonly exportedCallableByName: ReadonlyMap<string, SymbolDefinition>;
 }
 
+/**
+ * A `ReadonlyMap<K, Scope>` view backed by a `K → ScopeId` map plus a
+ * `ScopeTree`, holding **no `Scope` objects of its own** — `.get` fetches via
+ * `scopeTree.getScope(id)`. Out-of-core scope index: the previous `Map<K, Scope>` form pinned every
+ * class + module `Scope` (and its heavy `bindings` payload) through emit, which
+ * defeated the disk-backed scope seal (the scopes stayed resident via this
+ * index). Delegating to the `scopeTree` means the index pins only ids, so once
+ * the tree seals to disk the scopes become collectible. Value-identical to a
+ * stored `Scope` (`getScope` returns the same object resident, or a
+ * value-identical revived one from disk), and iteration follows the `idByKey`
+ * insertion order = the old map's order, so consumers are byte-identical.
+ */
+class ScopeByKeyView<K> implements ReadonlyMap<K, Scope> {
+  constructor(
+    private readonly idByKey: ReadonlyMap<K, ScopeId>,
+    private readonly scopeTree: ScopeTree,
+  ) {}
+
+  get(key: K): Scope | undefined {
+    const id = this.idByKey.get(key);
+    return id === undefined ? undefined : this.scopeTree.getScope(id);
+  }
+  has(key: K): boolean {
+    return this.idByKey.has(key);
+  }
+  get size(): number {
+    return this.idByKey.size;
+  }
+  *entries(): MapIterator<[K, Scope]> {
+    for (const [k, id] of this.idByKey) {
+      const s = this.scopeTree.getScope(id);
+      if (s !== undefined) yield [k, s];
+    }
+  }
+  keys(): MapIterator<K> {
+    return this.idByKey.keys();
+  }
+  *values(): MapIterator<Scope> {
+    for (const [, s] of this.entries()) yield s;
+  }
+  forEach(cb: (value: Scope, key: K, map: ReadonlyMap<K, Scope>) => void, thisArg?: unknown): void {
+    for (const [k, s] of this.entries()) cb.call(thisArg, s, k, this);
+  }
+  [Symbol.iterator](): MapIterator<[K, Scope]> {
+    return this.entries();
+  }
+}
+
+/**
+ * Build the workspace scope-lookup index. When `scopeTree` is supplied (the live
+ * pipeline), the `Scope`-valued maps are id-backed views that delegate to it —
+ * so this index never pins `Scope` objects and the disk seal can actually
+ * reclaim them. Without it (unit tests), the legacy direct `Map<K, Scope>` form
+ * is returned unchanged.
+ */
 export function buildWorkspaceResolutionIndex(
   parsedFiles: readonly ParsedFile[],
+  scopeTree?: ScopeTree,
 ): WorkspaceResolutionIndex {
-  const classScopeByDefId = new Map<string, Scope>();
-  const moduleScopeByFile = new Map<string, Scope>();
-  const memberByOwner = new Map<string, Map<string, SymbolDefinition>>();
-  const defsByFileAndName = new Map<string, Map<string, SymbolDefinition>>();
-  const callablesBySimpleName = new Map<string, SymbolDefinition[]>();
+  const classScopeIdByDefId = new Map<string, ScopeId>();
+  const classScopeIdToDefId = new Map<ScopeId, string>();
+  const moduleScopeIdByFile = new Map<string, ScopeId>();
+  const exportedCallableByName = new Map<string, SymbolDefinition>();
+  // Back-compat (no scopeTree): keep the direct Scope-object maps.
+  const classScopeByDefIdDirect = scopeTree === undefined ? new Map<string, Scope>() : undefined;
+  const moduleScopeByFileDirect = scopeTree === undefined ? new Map<string, Scope>() : undefined;
 
   for (const parsed of parsedFiles) {
-    // module scope by file
     const moduleScope = parsed.scopes.find((s) => s.kind === 'Module');
-    if (moduleScope !== undefined) moduleScopeByFile.set(parsed.filePath, moduleScope);
-
-    // class scopes
-    for (const scope of parsed.scopes) {
-      if (scope.kind !== 'Class') continue;
-      const cd = scope.ownedDefs.find((d) => d.type === 'Class');
-      if (cd !== undefined) classScopeByDefId.set(cd.nodeId, scope);
-    }
-
-    // Module-export pass — use the module scope's own `bindings` map
-    // as the source of truth for "what names this module exports".
-    // The scope extractor populates moduleScope.bindings with exactly
-    // the names visible at module level: top-level class/function
-    // declarations, module-level variable assignments, imports, etc.
-    // Filtering to `origin === 'local'` keeps only locally-defined
-    // names (not imports or wildcard re-exports brought in from
-    // elsewhere), which matches the pre-fix invariant that
-    // defsByFileAndName was built from `parsed.localDefs`.
-    //
-    // Class methods, class-body attributes, and nested-function defs
-    // are NOT in moduleScope.bindings — they're bound at their
-    // containing (Class or Function) scope — so they're naturally
-    // excluded, no per-kind filter required.
-    let fileBucket = defsByFileAndName.get(parsed.filePath);
-    if (fileBucket === undefined) {
-      fileBucket = new Map();
-      defsByFileAndName.set(parsed.filePath, fileBucket);
-    }
     if (moduleScope !== undefined) {
-      for (const [, refs] of moduleScope.bindings) {
+      moduleScopeIdByFile.set(parsed.filePath, moduleScope.id);
+      moduleScopeByFileDirect?.set(parsed.filePath, moduleScope);
+      // Precompute the findExportedDefByName workspace fallback: first
+      // module-local (origin 'local') callable per name, first file wins —
+      // read from the resident bindings here, ONCE.
+      for (const [name, refs] of moduleScope.bindings) {
+        if (exportedCallableByName.has(name)) continue;
         for (const ref of refs) {
           if (ref.origin !== 'local') continue;
-          const def = ref.def;
-          const simple = simpleQualifiedName(def);
-          if (simple === undefined) continue;
-          // First-seen wins to match `findExportedDef` semantics.
-          if (!fileBucket.has(simple)) fileBucket.set(simple, def);
-          if (def.type === 'Function' || def.type === 'Method' || def.type === 'Constructor') {
-            let bucket = callablesBySimpleName.get(simple);
-            if (bucket === undefined) {
-              bucket = [];
-              callablesBySimpleName.set(simple, bucket);
-            }
-            bucket.push(def);
+          const t = ref.def.type;
+          if (t === 'Function' || t === 'Method' || t === 'Constructor') {
+            exportedCallableByName.set(name, ref.def);
+            break;
           }
         }
       }
     }
 
-    // Member-by-owner pass — keyed on `ownerId`, so it must iterate
-    // `parsed.localDefs` (class-owned defs live in nested class scopes,
-    // not the module scope). Requires populateOwners to have run first.
-    for (const def of parsed.localDefs) {
-      const ownerId = (def as { ownerId?: string }).ownerId;
-      if (ownerId === undefined) continue;
-      const simple = simpleQualifiedName(def);
-      if (simple === undefined) continue;
-      let memberBucket = memberByOwner.get(ownerId);
-      if (memberBucket === undefined) {
-        memberBucket = new Map();
-        memberByOwner.set(ownerId, memberBucket);
+    for (const scope of parsed.scopes) {
+      if (scope.kind !== 'Class') continue;
+      const cd = scope.ownedDefs.find((d) => isClassLike(d.type));
+      if (cd !== undefined) {
+        classScopeIdByDefId.set(cd.nodeId, scope.id);
+        classScopeIdToDefId.set(scope.id, cd.nodeId);
+        classScopeByDefIdDirect?.set(cd.nodeId, scope);
       }
-      // First-seen wins to match `findOwnedMember` semantics.
-      if (!memberBucket.has(simple)) memberBucket.set(simple, def);
     }
   }
 
-  return {
-    classScopeByDefId,
-    memberByOwner,
-    defsByFileAndName,
-    callablesBySimpleName,
-    moduleScopeByFile,
-  };
+  const classScopeByDefId: ReadonlyMap<string, Scope> =
+    scopeTree === undefined
+      ? classScopeByDefIdDirect!
+      : new ScopeByKeyView(classScopeIdByDefId, scopeTree);
+  const moduleScopeByFile: ReadonlyMap<string, Scope> =
+    scopeTree === undefined
+      ? moduleScopeByFileDirect!
+      : new ScopeByKeyView(moduleScopeIdByFile, scopeTree);
+
+  return { classScopeByDefId, classScopeIdToDefId, moduleScopeByFile, exportedCallableByName };
 }

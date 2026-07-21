@@ -10,8 +10,16 @@
  * Lifecycle contract (RFC §2.8): scopes are **constructed during extraction,
  * linked during finalize, immutable after finalize**. All fields are
  * `readonly` at the type level; `Object.freeze` is applied at runtime in dev
- * builds. `ReferenceIndex` is the sole structure populated after freeze — by
- * resolution, before emission.
+ * builds.
+ *
+ * Two structures are populated after freeze:
+ *   1. `ReferenceIndex` — by resolution, before emission.
+ *   2. `ScopeResolutionIndexes.bindingAugmentations` — the dedicated
+ *      append-only post-finalize binding channel (e.g. C# same-namespace
+ *      cross-file fanout). The companion `indexes.bindings` is the
+ *      finalize-output channel and is deep-frozen by `materializeBindings`;
+ *      walkers consult both via `lookupBindingsAt`. See `ScopeResolver`
+ *      Invariant I8 for the full lifecycle contract.
  */
 
 import type { NodeLabel } from '../graph/types.js';
@@ -25,14 +33,27 @@ export type ScopeId = string;
 /** Stable symbol-definition identifier (graph nodeId). */
 export type DefId = string;
 
-/** Kinds of lexical scope a `Scope` node can represent. */
+/**
+ * Kinds of lexical scope a `Scope` node can represent.
+ *
+ * `Object` is a hoist boundary ONLY: an object/record literal body
+ * (TS/JS `{...}`, Kotlin anonymous `object {...}`). Members are
+ * reachable via property access, never as bare identifiers, so
+ * scope-chain walkers (`scope/walkers.ts`) must skip an `Object`
+ * scope's own bindings while still traversing past it to the parent
+ * (#2545/#2551) -- unlike `Block`, where a nested closure legitimately
+ * DOES see a sibling `let`/`const` from an enclosing `if`/`for`/`while`,
+ * a nested closure inside an object literal must NOT see a sibling
+ * property's name as a free identifier.
+ */
 export type ScopeKind =
   | 'Module' // file root
   | 'Namespace' // C++ namespace, C# namespace, Kotlin package-object, Rust mod
   | 'Class' // class/struct/trait/interface body
   | 'Function' // function/method/closure/lambda body
   | 'Block' // { ... }, if-body, for-body, with-body, match arms
-  | 'Expression'; // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Expression' // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Object'; // object/record literal body -- see doc comment above
 
 // ─── Range + Capture (parser-agnostic) ──────────────────────────────────────
 
@@ -97,6 +118,16 @@ export type ParsedImport =
       readonly localName: string;
       readonly importedName: string;
       readonly targetRaw: string;
+      /** Provider-specific imported symbol category when module and symbol
+       * namespaces have distinct resolution rules (for example PHP). */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
+      /**
+       * Set by providers when `targetRaw` already names the imported symbol
+       * rather than only its containing module. Consumers that compose
+       * `<local>.<member>` paths can then use `targetRaw.<member>` instead of
+       * duplicating `importedName`.
+       */
+      readonly targetIncludesImportedName?: boolean;
     }
   /**
    * Per-name import with rename.
@@ -111,6 +142,10 @@ export type ParsedImport =
       readonly importedName: string;
       readonly alias: string;
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
+      /** See the same field on the `named` variant. */
+      readonly targetIncludesImportedName?: boolean;
     }
   /**
    * Qualified module handle, with or without rename. `importedName` is the
@@ -182,6 +217,42 @@ export type ParsedImport =
       readonly localName: string;
       /** Source text of the unresolved expression when available; `null` otherwise. */
       readonly targetRaw: string | null;
+    }
+  /**
+   * Lazy / dynamic import whose target IS a static string literal at parse
+   * time, so it can be linked to a concrete `targetFile`. No local name
+   * binding is materialized — `import('./m')` returns `Promise<Module>` and
+   * any consumer-visible names appear via subsequent `.then(({ X }) => …)`
+   * destructuring, which is outside the static-import surface. The edge
+   * exists for module-reachability and impact analysis (so editing `./m`
+   * still flags the dynamic importer as affected).
+   *
+   * Providers MUST only emit this kind when `targetRaw` is a literal
+   * string they can hand to `resolveImportTarget`; expression arguments
+   * stay `dynamic-unresolved`.
+   *
+   * Examples:
+   *   - JS `import('./feature')`                  → `{ kind: 'dynamic-resolved', targetRaw: './feature' }`
+   *   - JS `await import('@scope/pkg/sub')`       → `{ kind: 'dynamic-resolved', targetRaw: '@scope/pkg/sub' }`
+   */
+  | {
+      readonly kind: 'dynamic-resolved';
+      readonly targetRaw: string;
+    }
+  /**
+   * Bare-source / side-effect import that introduces no local name binding
+   * but still establishes a file-level dependency. Resolves to a concrete
+   * `targetFile` via `resolveImportTarget` and produces a file→file
+   * `ImportEdge` for module-reachability and impact analysis, with no
+   * `BindingRef` materialized.
+   *
+   * Examples:
+   *   - JS / TS `import './polyfill'`        → `{ kind: 'side-effect', targetRaw: './polyfill' }`
+   *   - Rust    `use foo::bar as _`          → side-effect (binding hidden under `_`)
+   */
+  | {
+      readonly kind: 'side-effect';
+      readonly targetRaw: string;
     };
 
 /**
@@ -223,8 +294,11 @@ export interface ScopeLookup {
 
 /** Call-site description passed to `arityCompatibility`. */
 export interface Callsite {
-  /** Number of arguments at the call site. */
-  readonly arity: number;
+  /** Number of arguments at the call site, if available. */
+  readonly arity?: number;
+  /** Inferred argument types at the call site, one per argument.
+   *  An empty string entry means the type was not inferred. */
+  readonly argumentTypes?: readonly string[];
 }
 
 // ─── §2.4 ImportEdge ────────────────────────────────────────────────────────
@@ -253,7 +327,9 @@ export interface ImportEdge {
     | 'namespace'
     | 'wildcard-expanded'
     | 'reexport'
-    | 'dynamic-unresolved';
+    | 'dynamic-unresolved'
+    | 'dynamic-resolved'
+    | 'side-effect';
   /** Re-export chain, for provenance (e.g., `['./y']` when re-exported via `./y`). */
   readonly transitiveVia?: readonly string[];
   /** Set to `'unresolved'` when the SCC fixpoint could not link this edge. */
@@ -390,7 +466,15 @@ export interface Reference {
   readonly toDef: DefId;
   /** Location of the reference in source. */
   readonly atRange: Range;
-  readonly kind: 'call' | 'read' | 'write' | 'type-reference' | 'inherits' | 'import-use';
+  readonly kind:
+    | 'call'
+    | 'read'
+    | 'write'
+    | 'type-reference'
+    | 'inherits'
+    | 'import-use'
+    | 'value-ref'
+    | 'macro';
   readonly confidence: number;
   readonly evidence: readonly ResolutionEvidence[];
 }

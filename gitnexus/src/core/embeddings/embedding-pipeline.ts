@@ -26,8 +26,6 @@ import {
   type EmbeddableNode,
   type SemanticSearchResult,
   type ModelProgress,
-  type EmbeddingContext,
-  DEFAULT_EMBEDDING_CONFIG,
   EMBEDDABLE_LABELS,
   isShortLabel,
   LABEL_METHOD,
@@ -36,20 +34,53 @@ import {
   collectBestChunks,
 } from './types.js';
 import {
-  EMBEDDING_TABLE_NAME,
-  EMBEDDING_INDEX_NAME,
-  CREATE_VECTOR_INDEX_QUERY,
-  STALE_HASH_SENTINEL,
-} from '../lbug/schema.js';
-import { loadVectorExtension } from '../lbug/lbug-adapter.js';
+  DEFAULT_VECTOR_MAX_DISTANCE,
+  getVectorMaxDistance,
+  resolveEmbeddingConfig,
+} from './config.js';
+import { rankExactEmbeddingRows, type ExactEmbeddingRow } from './exact-search.js';
+import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME, STALE_HASH_SENTINEL } from '../lbug/schema.js';
+import { loadVectorExtension, createVectorIndex } from '../lbug/lbug-adapter.js';
+import { escapeCypherString } from '../lbug/cypher-escape.js';
+import type { ExtensionInstallPolicy } from '../lbug/extension-loader.js';
+import { getExactScanLimit } from '../platform/capabilities.js';
+import { logger } from '../logger.js';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+const vectorUnavailableMessage =
+  'VECTOR extension unavailable; semantic embeddings fall back to exact scan. ' +
+  'To enable vector search, install it once with network access ' +
+  '(GITNEXUS_LBUG_EXTENSION_INSTALL=auto), or pre-install it for offline use. ' +
+  'Set GITNEXUS_LBUG_EXTENSION_INSTALL=never to skip installs and silence this.';
+
+/**
+ * Resolve the extension-install policy for the embedding WRITE path (analyze).
+ *
+ * Generating embeddings is an explicit opt-in to a feature that requires the
+ * VECTOR extension, so when the operator has NOT pinned a policy we default to
+ * `auto` (one bounded, out-of-process INSTALL) — matching the documented
+ * "auto = default for analyze" intent in extension-loader.ts. An explicit
+ * GITNEXUS_LBUG_EXTENSION_INSTALL=load-only|never|auto always wins, so an
+ * offline or locked-down operator is never silently forced onto the network
+ * (the #1153 regression caused by hard-coding `auto` here). Read on every call
+ * (not memoized) so test env stubbing works.
+ */
+export const resolveEmbeddingInstallPolicy = (): ExtensionInstallPolicy => {
+  const raw = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+  if (raw === 'load-only' || raw === 'never' || raw === 'auto') return raw;
+  return 'auto';
+};
+
+const ensureVectorExtensionAvailable = async (): Promise<boolean> => {
+  return loadVectorExtension(undefined, { policy: resolveEmbeddingInstallPolicy() });
+};
 /**
  * Bump this when the embedding text template changes in a way that should
  * invalidate existing vectors, such as metadata/header shape changes,
  * structural container context changes, or preceding-context formatting rules.
  */
-export const EMBEDDING_TEXT_VERSION = 'v2';
+export const EMBEDDING_TEXT_VERSION = 'v4';
 
 /**
  * Compute a stable content fingerprint for an embeddable node.
@@ -144,12 +175,55 @@ const queryEmbeddableNodes = async (
       }
     } catch (error) {
       if (isDev) {
-        console.warn(`Query for ${label} nodes failed:`, error);
+        logger.warn({ error }, `Query for ${label} nodes failed:`);
       }
     }
   }
 
-  return allNodes;
+  return allNodes.length > 0 ? allNodes : queryFallbackFileNodes(executeQuery);
+};
+
+/**
+ * Static and documentation repositories may contain no code symbols while
+ * still persisting useful text on File nodes. Keep File embeddings as a
+ * zero-symbol fallback so code repositories retain symbol-first selection.
+ */
+const queryFallbackFileNodes = async (
+  executeQuery: (cypher: string) => Promise<any[]>,
+): Promise<EmbeddableNode[]> => {
+  try {
+    const rows = await executeQuery(`
+      MATCH (n:File)
+      RETURN n.id AS id, n.name AS name, 'File' AS label,
+             n.filePath AS filePath, n.content AS content
+    `);
+
+    return rows
+      .map((row) => {
+        const content = row.content ?? row[4] ?? '';
+        return {
+          id: row.id ?? row[0],
+          name: row.name ?? row[1],
+          label: row.label ?? row[2] ?? 'File',
+          filePath: row.filePath ?? row[3],
+          content,
+          startLine: 1,
+          endLine: Math.max(1, content.split('\n').length),
+        };
+      })
+      .filter(
+        (node) =>
+          node.id &&
+          node.filePath &&
+          node.content.trim() &&
+          node.content !== '[Binary file - content not stored]',
+      );
+  } catch (error) {
+    if (isDev) {
+      logger.warn({ error }, 'Fallback File-node embedding query failed:');
+    }
+    return [];
+  }
 };
 
 /**
@@ -169,7 +243,6 @@ export const batchInsertEmbeddings = async (
     contentHash?: string;
   }>,
 ): Promise<void> => {
-  const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
   const paramsList = updates.map((u) => ({
     id: `${u.nodeId}:${u.chunkIndex}`,
     nodeId: u.nodeId,
@@ -179,28 +252,115 @@ export const batchInsertEmbeddings = async (
     embedding: u.embedding,
     contentHash: u.contentHash ?? STALE_HASH_SENTINEL,
   }));
+  if (paramsList.length === 0) return;
+
+  await executeWithReusedStatement(
+    `MATCH (e:${EMBEDDING_TABLE_NAME} {id: $id}) DELETE e`,
+    paramsList.map(({ id }) => ({ id })),
+  );
+  const cypher = `CREATE (e:${EMBEDDING_TABLE_NAME} {id: $id, nodeId: $nodeId, chunkIndex: $chunkIndex, startLine: $startLine, endLine: $endLine, embedding: $embedding, contentHash: $contentHash})`;
   await executeWithReusedStatement(cypher, paramsList);
 };
 
 /**
- * Create the vector index for semantic search
-
- * Now indexes the separate CodeEmbedding table.
- * Delegates extension loading to lbug-adapter's loadVectorExtension(),
- * which owns the VECTOR extension lifecycle and state tracking.
-
+ * Create the vector index for semantic search (indexes the CodeEmbedding table).
+ *
+ * Keeps the embedding-specific extension-install policy gate here
+ * (ensureVectorExtensionAvailable → resolveEmbeddingInstallPolicy, default
+ * `auto` for the analyze write path), then delegates the actual
+ * `CALL CREATE_VECTOR_INDEX(...)` to the adapter, which runs it through the
+ * unprepared `conn.query()` path. It must NOT go through the injected
+ * `executeQuery` (prepared `conn.prepare()`): LadybugDB cannot prepare that
+ * procedure and fails with "We do not support prepare multiple statements" —
+ * the silent degrade in #2114.
+ *
+ * Exported for run-analyze's wipe-and-restore seam (tri-review 4669518496
+ * P1): a full-rebuild/escalated write wipes the DB files — index included —
+ * and a preserve-only run restores embedding ROWS without ever reaching the
+ * pipeline call sites below, so the orchestrator recreates the index through
+ * this same policy-gated, warn-on-failure entry point. Consumed there via
+ * dynamic import only (lazy-embeddings convention, #2370).
  */
-const createVectorIndex = async (
-  executeQuery: (cypher: string) => Promise<any[]>,
-): Promise<void> => {
-  // Delegate to the adapter which tracks loaded state and handles DB reconnect resets
-  await loadVectorExtension();
-
+export const buildVectorIndex = async (): Promise<boolean> => {
+  // This pre-check applies the embedding-specific install policy
+  // (resolveEmbeddingInstallPolicy, default `auto` for analyze) before reaching
+  // the adapter. The adapter's createVectorIndex() calls loadVectorExtension()
+  // again, but that's a no-op here: once this gate loads VECTOR the module-level
+  // `vectorExtensionLoaded` flag is set, so the adapter's second call
+  // short-circuits without re-resolving the policy — no double install.
+  if (!(await ensureVectorExtensionAvailable())) return false;
   try {
-    await executeQuery(CREATE_VECTOR_INDEX_QUERY);
+    return await createVectorIndex();
   } catch (error) {
-    if (isDev) {
-      console.warn('Vector index creation warning:', error);
+    // Surface this even outside dev: it silently downgrades a user-requested
+    // feature (semantic search) to exact scan. Log under `err` so pino's
+    // standard serializer captures the message/stack — logging under `error`
+    // serialized an Error to `{}` (the empty `{"error":{}}` reported in #2114).
+    logger.warn(
+      { err: error },
+      'Vector index creation failed; semantic search will use exact-scan fallback',
+    );
+    return false;
+  }
+};
+
+export interface EmbeddingPipelineResult {
+  nodesProcessed: number;
+  chunksProcessed: number;
+  vectorIndexReady: boolean;
+  semanticMode: 'vector-index' | 'exact-scan';
+}
+
+export interface EmbeddingPipelineCheckpoint {
+  nodesProcessed: number;
+  totalNodes: number;
+  chunksProcessed: number;
+}
+
+export interface EmbeddingPipelineCheckpointWindow extends EmbeddingPipelineCheckpoint {
+  nodeIds: string[];
+}
+
+export interface EmbeddingPipelineOptions {
+  signal?: AbortSignal;
+  checkpointEveryNodes?: number;
+  forceReembedNodeIds?: ReadonlySet<string>;
+  onCheckpointWindowStart?: (window: EmbeddingPipelineCheckpointWindow) => Promise<void>;
+  onCheckpoint?: (checkpoint: EmbeddingPipelineCheckpoint) => Promise<void>;
+}
+
+/**
+ * DELETE stale embedding rows for the given nodeIds so they can be re-inserted.
+ *
+ * Kuzu forbids SET on vector-indexed properties; DELETE-then-INSERT is the
+ * sanctioned pattern. A `"does not exist"` error means the rows are already gone
+ * (safe to proceed); any other error risks vector-index corruption, so it
+ * propagates and aborts the pipeline.
+ *
+ * Called per-batch (just before each batch's INSERT), not once up front — see
+ * the caller comment / KTD7: an up-front bulk delete of every stale row leaves
+ * the whole index deleted-not-reinserted if the re-embed is interrupted. Per-batch
+ * interleaving bounds that window to a single batch.
+ */
+const deleteStaleEmbeddingRows = async (
+  executeWithReusedStatement: (
+    cypher: string,
+    paramsList: Array<Record<string, any>>,
+  ) => Promise<void>,
+  nodeIds: string[],
+): Promise<void> => {
+  if (nodeIds.length === 0) return;
+  try {
+    await executeWithReusedStatement(
+      `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
+      nodeIds.map((nodeId) => ({ nodeId })),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('does not exist')) {
+      throw new Error(
+        `[embed] Failed to delete stale embedding rows — aborting to prevent vector-index corruption: ${msg}`,
+      );
     }
   }
 };
@@ -213,11 +373,9 @@ const createVectorIndex = async (
  * @param onProgress - Callback for progress updates
  * @param config - Optional configuration override
  * @param skipNodeIds - Optional set of node IDs that already have embeddings (incremental mode)
- * @param context - Optional repo/server context for metadata enrichment
  * @param existingEmbeddings - Optional map of nodeId → contentHash for incremental mode.
  *        Nodes whose hash matches are skipped; nodes with a changed hash are DELETE'd
  *        and re-embedded; nodes not in the map are embedded fresh.
-
  */
 export const runEmbeddingPipeline = async (
   executeQuery: (cypher: string) => Promise<any[]>,
@@ -228,12 +386,25 @@ export const runEmbeddingPipeline = async (
   onProgress: EmbeddingProgressCallback,
   config: Partial<EmbeddingConfig> = {},
   skipNodeIds?: Set<string>,
-  context?: EmbeddingContext,
   existingEmbeddings?: Map<string, string>,
-): Promise<void> => {
-  const finalConfig = { ...DEFAULT_EMBEDDING_CONFIG, ...config };
+  pipelineOptions: EmbeddingPipelineOptions = {},
+): Promise<EmbeddingPipelineResult> => {
+  const finalConfig = resolveEmbeddingConfig(config);
+  let totalChunks = 0;
+  const checkpointEveryNodes = pipelineOptions.checkpointEveryNodes ?? 5_000;
+  if (!Number.isSafeInteger(checkpointEveryNodes) || checkpointEveryNodes <= 0) {
+    throw new Error('checkpointEveryNodes must be a positive integer');
+  }
+  const throwIfCancelled = (): void => pipelineOptions.signal?.throwIfAborted();
 
   try {
+    throwIfCancelled();
+    const vectorAvailable = await ensureVectorExtensionAvailable();
+    throwIfCancelled();
+    if (!vectorAvailable) {
+      logger.warn(vectorUnavailableMessage);
+    }
+
     // Phase 1: Load embedding model
     onProgress({
       phase: 'loading-model',
@@ -250,6 +421,7 @@ export const runEmbeddingPipeline = async (
           modelDownloadPercent: downloadPercent,
         });
       }, finalConfig);
+      throwIfCancelled();
     }
 
     onProgress({
@@ -259,86 +431,72 @@ export const runEmbeddingPipeline = async (
     });
 
     if (isDev) {
-      console.log('🔍 Querying embeddable nodes...');
+      logger.info('🔍 Querying embeddable nodes...');
     }
 
     // Phase 2: Query embeddable nodes
     let nodes = await queryEmbeddableNodes(executeQuery);
-
-    // Apply context metadata
-    if (context?.repoName) {
-      for (const node of nodes) {
-        node.repoName = context.repoName;
-        node.serverName = context.serverName;
-      }
-    }
+    throwIfCancelled();
+    const embeddableNodeIds = new Set(nodes.map((node) => node.id));
 
     // Incremental mode: compare content hashes, delete stale rows, skip fresh ones.
     // Computed hashes for stale nodes are cached so batchInsertEmbeddings can reuse them
     // (avoids double computation).
     const computedStaleHashes = new Map<string, string>();
-    if (existingEmbeddings && existingEmbeddings.size > 0) {
+    // Stale rows are DELETE'd per-batch (just before each batch's INSERT) rather
+    // than all up front — see U6 / KTD7. `staleNodeIds` is consulted inside the
+    // batch loop; it stays empty in full (non-incremental) mode so no deletes fire.
+    const staleNodeIds = new Set<string>();
+    const forceReembedNodeIds = pipelineOptions.forceReembedNodeIds;
+    if (
+      (existingEmbeddings && existingEmbeddings.size > 0) ||
+      (forceReembedNodeIds && forceReembedNodeIds.size > 0)
+    ) {
       const beforeCount = nodes.length;
-      const staleNodeIds: string[] = [];
       nodes = nodes.filter((n) => {
-        const existingHash = existingEmbeddings.get(n.id);
+        const existingHash = existingEmbeddings?.get(n.id);
         if (existingHash === undefined) {
           // New node — needs embedding
           return true;
         }
         const currentHash = contentHashForNode(n, finalConfig);
-        if (currentHash !== existingHash) {
+        if (currentHash !== existingHash || forceReembedNodeIds?.has(n.id)) {
           // Content changed — cache hash for reuse during insert, mark for DELETE + re-embed
           computedStaleHashes.set(n.id, currentHash);
-          staleNodeIds.push(n.id);
+          staleNodeIds.add(n.id);
           return true;
         }
         // Hash matches — skip (fresh); no need to cache hash for skipped nodes
         return false;
       });
 
-      // DELETE stale embedding rows so they can be re-inserted
-      // (Kuzu forbids SET on vector-indexed properties; DELETE-then-INSERT is the sanctioned pattern)
-      if (staleNodeIds.length > 0) {
-        if (isDev) {
-          console.log(`🔄 Deleting ${staleNodeIds.length} stale embedding rows for re-embed`);
-        }
-        try {
-          await executeWithReusedStatement(
-            `MATCH (e:${EMBEDDING_TABLE_NAME} {nodeId: $nodeId}) DELETE e`,
-            staleNodeIds.map((nodeId) => ({ nodeId })),
-          );
-        } catch (err) {
-          // "does not exist" = rows already gone — safe to proceed.
-          // All other errors risk vector-index corruption (Kuzu requires DELETE-before-INSERT
-          // for vector-indexed properties) — propagate so the pipeline aborts cleanly.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!msg.includes('does not exist')) {
-            throw new Error(
-              `[embed] Failed to delete stale embedding rows — aborting to prevent vector-index corruption: ${msg}`,
-            );
-          }
-        }
-      }
-
       if (isDev) {
-        console.log(
-          `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.length} stale, ${nodes.length} to embed`,
+        logger.info(
+          `📦 Incremental embeddings: ${beforeCount} total, ${existingEmbeddings.size} cached, ${staleNodeIds.size} stale, ${nodes.length} to embed`,
         );
       }
+    }
+
+    if (forceReembedNodeIds && forceReembedNodeIds.size > 0) {
+      const removedPendingNodeIds = [...forceReembedNodeIds].filter(
+        (nodeId) => !embeddableNodeIds.has(nodeId),
+      );
+      await deleteStaleEmbeddingRows(executeWithReusedStatement, removedPendingNodeIds);
+      throwIfCancelled();
     }
 
     const totalNodes = nodes.length;
 
     if (isDev) {
-      console.log(`📊 Found ${totalNodes} embeddable nodes`);
+      logger.info(`📊 Found ${totalNodes} embeddable nodes`);
     }
 
     if (totalNodes === 0) {
+      throwIfCancelled();
       // Ensure the vector index exists even when no new nodes need embedding.
       // A prior crash or first-time incremental run may have left CodeEmbedding
       // rows without ever reaching index creation.
-      await createVectorIndex(executeQuery);
+      const vectorIndexReady = await buildVectorIndex();
 
       onProgress({
         phase: 'ready',
@@ -346,15 +504,23 @@ export const runEmbeddingPipeline = async (
         nodesProcessed: 0,
         totalNodes: 0,
       });
-      return;
+      return {
+        nodesProcessed: 0,
+        chunksProcessed: 0,
+        vectorIndexReady,
+        semanticMode: vectorIndexReady ? 'vector-index' : 'exact-scan',
+      };
     }
 
     // Phase 3: Chunk + embed nodes
     const batchSize = finalConfig.batchSize;
     const chunkSize = finalConfig.chunkSize;
     const overlap = finalConfig.overlap;
+    const checkpointWindowNodeCount = Math.max(
+      batchSize,
+      Math.ceil(checkpointEveryNodes / batchSize) * batchSize,
+    );
     let processedNodes = 0;
-    let totalChunks = 0;
 
     onProgress({
       phase: 'embedding',
@@ -367,6 +533,18 @@ export const runEmbeddingPipeline = async (
 
     // Process in batches of nodes
     for (let batchIndex = 0; batchIndex < totalNodes; batchIndex += batchSize) {
+      throwIfCancelled();
+      if (pipelineOptions.onCheckpointWindowStart && batchIndex % checkpointWindowNodeCount === 0) {
+        await pipelineOptions.onCheckpointWindowStart({
+          nodesProcessed: processedNodes,
+          totalNodes,
+          chunksProcessed: totalChunks,
+          nodeIds: nodes
+            .slice(batchIndex, batchIndex + checkpointWindowNodeCount)
+            .map((node) => node.id),
+        });
+        throwIfCancelled();
+      }
       const batch = nodes.slice(batchIndex, batchIndex + batchSize);
 
       // Chunk each node and generate text
@@ -414,9 +592,9 @@ export const runEmbeddingPipeline = async (
             );
           } catch (chunkErr) {
             if (isDev) {
-              console.warn(
+              logger.warn(
+                { chunkErr },
                 `⚠️ AST chunking failed for ${node.label} "${node.name}" (${node.filePath}), falling back to character-based chunking:`,
-                chunkErr,
               );
             }
             chunks = characterChunk(node.content, startLine, endLine, chunkSize, overlap);
@@ -444,19 +622,26 @@ export const runEmbeddingPipeline = async (
         }
       }
 
+      // U6 / KTD7: delete this batch's stale rows immediately before its inserts,
+      // so an interrupted re-embed loses at most one batch (not the whole index).
+      // Preserves Kuzu's required DELETE-before-INSERT for vector-indexed rows.
+      const batchStaleIds = batch.filter((n) => staleNodeIds.has(n.id)).map((n) => n.id);
+      await deleteStaleEmbeddingRows(executeWithReusedStatement, batchStaleIds);
+      throwIfCancelled();
+
       // Embed chunk texts in sub-batches to control memory
-      const EMBED_SUB_BATCH = 8;
+      const EMBED_SUB_BATCH = finalConfig.subBatchSize;
       for (let si = 0; si < allTexts.length; si += EMBED_SUB_BATCH) {
         const subTexts = allTexts.slice(si, si + EMBED_SUB_BATCH);
         const subUpdates = allUpdates.slice(si, si + EMBED_SUB_BATCH);
 
         let embeddings: Float32Array[];
         try {
-          embeddings = await embedBatch(subTexts);
+          embeddings = await embedBatch(subTexts, { signal: pipelineOptions.signal });
         } catch (embedErr) {
-          console.error(
+          logger.error(
+            { embedErr },
             `❌ embedBatch failed for ${subTexts.length} texts (first: "${subTexts[0]?.substring(0, 80)}..."):`,
-            embedErr,
           );
           throw embedErr;
         }
@@ -467,6 +652,7 @@ export const runEmbeddingPipeline = async (
         }));
 
         await batchInsertEmbeddings(executeWithReusedStatement, dbUpdates);
+        throwIfCancelled();
       }
 
       processedNodes += batch.length;
@@ -481,9 +667,22 @@ export const runEmbeddingPipeline = async (
         currentBatch: Math.floor(batchIndex / batchSize) + 1,
         totalBatches: Math.ceil(totalNodes / batchSize),
       });
+
+      if (
+        pipelineOptions.onCheckpoint &&
+        (processedNodes % checkpointWindowNodeCount === 0 || processedNodes === totalNodes)
+      ) {
+        await pipelineOptions.onCheckpoint({
+          nodesProcessed: processedNodes,
+          totalNodes,
+          chunksProcessed: totalChunks,
+        });
+        throwIfCancelled();
+      }
     }
 
     // Phase 4: Create vector index
+    throwIfCancelled();
     onProgress({
       phase: 'indexing',
       percent: 90,
@@ -492,10 +691,10 @@ export const runEmbeddingPipeline = async (
     });
 
     if (isDev) {
-      console.log('📇 Creating vector index...');
+      logger.info('📇 Creating vector index...');
     }
 
-    await createVectorIndex(executeQuery);
+    const vectorIndexReady = await buildVectorIndex();
 
     onProgress({
       phase: 'ready',
@@ -505,15 +704,21 @@ export const runEmbeddingPipeline = async (
     });
 
     if (isDev) {
-      console.log(
+      logger.info(
         `✅ Embedding pipeline complete! (${totalChunks} chunks from ${totalNodes} nodes)`,
       );
     }
+    return {
+      nodesProcessed: totalNodes,
+      chunksProcessed: totalChunks,
+      vectorIndexReady,
+      semanticMode: vectorIndexReady ? 'vector-index' : 'exact-scan',
+    };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
     if (isDev) {
-      console.error('❌ Embedding pipeline error:', error);
+      logger.error({ error }, '❌ Embedding pipeline error:');
     }
 
     onProgress({
@@ -533,7 +738,7 @@ export const semanticSearch = async (
   executeQuery: (cypher: string) => Promise<any[]>,
   query: string,
   k: number = 10,
-  maxDistance: number = 0.5,
+  maxDistance: number = getVectorMaxDistance(DEFAULT_VECTOR_MAX_DISTANCE),
 ): Promise<SemanticSearchResult[]> => {
   if (!isEmbedderReady()) {
     throw new Error('Embedding model not initialized. Run embedding pipeline first.');
@@ -543,27 +748,75 @@ export const semanticSearch = async (
   const queryVec = embeddingToArray(queryEmbedding);
   const queryVecStr = `[${queryVec.join(',')}]`;
 
-  const bestChunks = await collectBestChunks(k, async (fetchLimit) => {
-    const vectorQuery = `
-      CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
-        CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${fetchLimit})
-      YIELD node AS emb, distance
-      WITH emb, distance
-      WHERE distance < ${maxDistance}
-      RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
-             emb.startLine AS startLine, emb.endLine AS endLine, distance
-      ORDER BY distance
-    `;
+  let bestChunks = new Map<
+    string,
+    { distance: number; chunkIndex: number; startLine: number; endLine: number }
+  >();
+  // Query/read path: NEVER spawn a network INSTALL on a user query. If the
+  // VECTOR extension was not pre-installed, fall back to exact scan rather than
+  // blocking the query on a download (offline-first; see extension-loader.ts
+  // "load-only" — used by all serve/MCP query paths).
+  if (await loadVectorExtension(undefined, { policy: 'load-only' })) {
+    try {
+      bestChunks = await collectBestChunks(k, async (fetchLimit) => {
+        const vectorQuery = `
+          CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
+            CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${fetchLimit})
+          YIELD node AS emb, distance
+          WITH emb, distance
+          WHERE distance < ${maxDistance}
+          RETURN emb.nodeId AS nodeId, emb.chunkIndex AS chunkIndex,
+                 emb.startLine AS startLine, emb.endLine AS endLine, distance
+          ORDER BY distance
+        `;
 
-    const embResults = await executeQuery(vectorQuery);
-    return embResults.map((row) => ({
-      nodeId: row.nodeId ?? row[0],
-      chunkIndex: row.chunkIndex ?? row[1] ?? 0,
-      startLine: row.startLine ?? row[2] ?? 0,
-      endLine: row.endLine ?? row[3] ?? 0,
-      distance: row.distance ?? row[4],
-    }));
-  });
+        const embResults = await executeQuery(vectorQuery);
+        return embResults.map((row) => ({
+          nodeId: row.nodeId ?? row[0],
+          chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+          startLine: row.startLine ?? row[2] ?? 0,
+          endLine: row.endLine ?? row[3] ?? 0,
+          distance: row.distance ?? row[4],
+        }));
+      });
+    } catch {
+      bestChunks = new Map();
+    }
+  }
+
+  if (bestChunks.size === 0) {
+    const countRows = await executeQuery(
+      `MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`,
+    );
+    const countRow = countRows[0];
+    const embeddingCount = Number(countRow?.cnt ?? countRow?.[0] ?? 0);
+    const exactLimit = getExactScanLimit();
+    if (embeddingCount > 0 && embeddingCount <= exactLimit) {
+      const rows = await executeQuery(`
+        MATCH (e:${EMBEDDING_TABLE_NAME})
+        RETURN e.nodeId AS nodeId, e.chunkIndex AS chunkIndex,
+               e.startLine AS startLine, e.endLine AS endLine, e.embedding AS embedding
+      `);
+      const exactRows: ExactEmbeddingRow[] = rows.map((row) => ({
+        nodeId: row.nodeId ?? row[0],
+        chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+        startLine: row.startLine ?? row[2] ?? 0,
+        endLine: row.endLine ?? row[3] ?? 0,
+        embedding: row.embedding ?? row[4] ?? [],
+      }));
+      bestChunks = new Map(
+        rankExactEmbeddingRows(exactRows, queryVec, k, maxDistance).map((row) => [
+          row.nodeId,
+          {
+            distance: row.distance,
+            chunkIndex: row.chunkIndex,
+            startLine: row.startLine,
+            endLine: row.endLine,
+          },
+        ]),
+      );
+    }
+  }
 
   if (bestChunks.size === 0) {
     return [];
@@ -585,7 +838,7 @@ export const semanticSearch = async (
   const results: SemanticSearchResult[] = [];
 
   for (const [label, items] of byLabel) {
-    const idList = items.map((i) => `'${i.nodeId.replace(/'/g, "''")}'`).join(', ');
+    const idList = items.map((i) => `'${escapeCypherString(i.nodeId)}'`).join(', ');
     try {
       const nodeQuery = `
         MATCH (n:\`${label}\`) WHERE n.id IN [${idList}]
@@ -631,7 +884,7 @@ export const semanticSearchWithContext = async (
   k: number = 5,
   _hops: number = 1,
 ): Promise<any[]> => {
-  const results = await semanticSearch(executeQuery, query, k, 0.5);
+  const results = await semanticSearch(executeQuery, query, k);
 
   return results.map((r) => ({
     matchId: r.nodeId,

@@ -18,13 +18,16 @@ import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import Python from 'tree-sitter-python';
 import CPP from 'tree-sitter-cpp';
-import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
+import { requireVendoredGrammar } from '../../src/core/tree-sitter/vendored-grammars.js';
+
+// Vendored grammars — loaded from vendor/ by absolute path, never node_modules (#2111).
+const Kotlin = requireVendoredGrammar('tree-sitter-kotlin');
 
 let Dart: unknown;
 try {
-  Dart = require('tree-sitter-dart');
+  Dart = requireVendoredGrammar('tree-sitter-dart');
   const testParser = new Parser();
   testParser.setLanguage(Dart as Parser.Language);
 } catch {
@@ -33,7 +36,7 @@ try {
 
 let Swift: unknown;
 try {
-  Swift = require('tree-sitter-swift');
+  Swift = requireVendoredGrammar('tree-sitter-swift');
   const testParser = new Parser();
   testParser.setLanguage(Swift as Parser.Language);
 } catch {
@@ -2893,6 +2896,24 @@ class User : BaseModel<string> {
       // Explicit annotation resolves it — no unverified binding needed
       expect(flatGet(typeEnv, 'user')).toBe('User');
       expect(typeEnv.constructorBindings.find((b) => b.varName === 'user')).toBeUndefined();
+    });
+
+    describeSwift('Swift constructor binding scanner', () => {
+      it('returns constructor binding for explicit User.init(...) calls', () => {
+        const tree = parseSwift(`
+func run() {
+  let user = User.init(name: "alice")
+}
+`);
+        const typeEnv = buildTypeEnv(tree, 'swift');
+        expect(flatGet(typeEnv, 'user')).toBeUndefined();
+        expect(typeEnv.constructorBindings).toEqual([
+          expect.objectContaining({
+            varName: 'user',
+            calleeName: 'User',
+          }),
+        ]);
+      });
     });
 
     it('returns constructor bindings for Python x = UnknownClass()', () => {
