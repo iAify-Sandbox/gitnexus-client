@@ -21,6 +21,7 @@
  * (defined in `./types.ts`).
  */
 
+import type { ParameterTypeClass } from './symbol-definition.js';
 import type { Range, ScopeId } from './types.js';
 
 /**
@@ -36,7 +37,23 @@ export type ReferenceKind =
   | 'write'
   | 'type-reference'
   | 'inherits'
-  | 'import-use';
+  | 'import-use'
+  // An identifier in object-literal property-value position
+  // (`{ emitScopeCaptures: emitCppScopeCaptures }`, shorthand `{ hook }`).
+  // Resolution is owned entirely by the post-finalize property-dispatch pass
+  // (`emitPropertyDispatchCalls` via the callable-gated finalized-bindings
+  // walker `findCallableBindingInScope`; `resolveReferenceSites` skips these
+  // sites), so a non-function value never produces a reference. Emitted as a `USES`
+  // reference edge — NOT `CALLS` (a registration is not an invocation;
+  // Kythe `ref` / Joern `METHOD_REF` precedent). The invocation side is
+  // recovered separately by the property-dispatch pass, which uses
+  // `propertyKey` to synthesize CALLS at member-call sites (#2437).
+  | 'value-ref'
+  // A macro invocation (`log!(...)` / `vec![...]`). Resolved against
+  // `Macro`-labeled definitions ONLY (see `MacroRegistry`) so a macro
+  // never aliases a same-named free function — macros and functions are
+  // disjoint namespaces. Emitted as a `USES` edge, not `CALLS`.
+  | 'macro';
 
 /**
  * How a call site binds its target. Informs `Registry.lookup` Step 2
@@ -53,6 +70,18 @@ export type CallForm = 'free' | 'member' | 'constructor' | 'index';
 export interface ReferenceSite {
   /** The name being referenced (e.g., `'save'`, `'User'`, `'count'`). */
   readonly name: string;
+  /**
+   * Optional raw, qualified form of the referenced name when the source wrote
+   * a qualified path (e.g. a C++ base `struct D : Other::Inner` yields
+   * `'Other::Inner'`). `name` keeps the simple tail (`'Inner'`) for the existing
+   * scope-chain contract; resolution normalizes this via `normalizeQualifiedName`
+   * and resolves it against the full-path `QualifiedNameIndex` BEFORE the
+   * simple-tail walk, so a same-tail nested base resolves to the correct
+   * sibling instead of the first-inserted one (issue #1982). Populated only by
+   * per-language captures that emit `@reference.qualified-name`; absent
+   * otherwise, in which case resolution is unchanged.
+   */
+  readonly rawQualifiedName?: string;
   /** Source-text range of this reference. */
   readonly atRange: Range;
   /**
@@ -71,4 +100,27 @@ export interface ReferenceSite {
   readonly explicitReceiver?: { readonly name: string };
   /** Argument count at the call site; used by `provider.arityCompatibility`. */
   readonly arity?: number;
+  /**
+   * Object-literal key under which a `value-ref` site registers its value
+   * (`{ emitScopeCaptures: emitHook }` → `'emitScopeCaptures'`; shorthand
+   * `{ emitHook }` → `'emitHook'`). Consumed by the property-dispatch pass
+   * to connect member-call sites (`x.emitScopeCaptures()`) to registered
+   * functions (#2437). Only set for `kind === 'value-ref'`.
+   */
+  readonly propertyKey?: string;
+  /**
+   * Inferred argument types at the call site, one per argument. An
+   * empty-string entry means "unknown" — consumers narrowing overload
+   * candidates treat unknown as any-match. Populated by languages
+   * that can derive types from literals / constructor expressions
+   * (C#: `42` → `'int'`, `"alice"` → `'string'`).
+   */
+  readonly argumentTypes?: readonly string[];
+  /**
+   * Optional per-argument type-shape sidecar for languages that need
+   * cv/ref/pointer distinctions during constraint filtering. This is
+   * intentionally separate from `argumentTypes`, which stays normalized
+   * for existing overload narrowing and conversion-rank logic.
+   */
+  readonly argumentTypeClasses?: readonly ParameterTypeClass[];
 }

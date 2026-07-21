@@ -51,6 +51,8 @@ import {
   finalize,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { parseTruthyEnv } from './utils/env.js';
+import { TransitionalScopeTree } from '../../storage/scope-index-store.js';
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -106,24 +108,28 @@ export function finalizeScopeModel(
   const allScopes: Scope[] = [];
   const allDefs: SymbolDefinition[] = [];
   const moduleEntries: { filePath: string; moduleScopeId: ScopeId }[] = [];
-  const allReferenceSites = [] as ReturnType<typeof collectReferenceSites>;
+  const allReferenceSites = collectReferenceSites(parsedFiles);
 
   for (const file of parsedFiles) {
     for (const s of file.scopes) allScopes.push(s);
     for (const d of file.localDefs) allDefs.push(d);
     moduleEntries.push({ filePath: file.filePath, moduleScopeId: file.moduleScope });
   }
-  // References kept out of the loop above to centralize list-init.
-  allReferenceSites.push(...collectReferenceSites(parsedFiles));
 
-  const scopeTree = buildScopeTree(allScopes);
+  // Out-of-core scope index: when enabled, build a TransitionalScopeTree
+  // (validated + fully resident now; sealed to disk by run.ts just before emit so
+  // the heavy Scope.bindings payload is reclaimed). Default off → the in-heap
+  // buildScopeTree result exactly, byte-identical.
+  const scopeTree = parseTruthyEnv(process.env.GITNEXUS_DISK_SCOPE_INDEX)
+    ? new TransitionalScopeTree(allScopes)
+    : buildScopeTree(allScopes);
   const defs = buildDefIndex(allDefs);
   const qualifiedNames = buildQualifiedNameIndex(allDefs);
   const moduleScopes = buildModuleScopeIndex(moduleEntries);
 
   // ── Step 3: MethodDispatchIndex. Today we lack per-language MRO
   // strategies wired into this orchestrator (that belongs with the
-  // HeritageMap bridge, a separate piece of work). Ship an EMPTY index
+  // MRO bridge, a separate piece of work). Ship an EMPTY index
   // so the bundle shape is consistent; the callbacks return `[]` for
   // every owner and `implementsOf` returns `[]`. Populating this
   // properly is tracked alongside the per-language provider hooks.
@@ -141,6 +147,16 @@ export function finalizeScopeModel(
     methodDispatch,
     imports: finalizeOut.imports,
     bindings: finalizeOut.bindings,
+    // Empty post-finalize augmentation channel. Populated (if at all)
+    // by language hooks like `populateCsharpNamespaceSiblings` running
+    // AFTER `finalizeScopeModel` returns, before `resolveReferenceSites`
+    // consumes the bundle. Most languages leave it empty.
+    bindingAugmentations: new Map(),
+    workspaceFqnBindings: new Map(),
+    workspaceTypeBindings: new Map(),
+    namespaceFqnBindings: new Map(),
+    namespaceTypeBindings: new Map(),
+    accessibleNamespacesByScope: new Map(),
     referenceSites: Object.freeze([...allReferenceSites]),
     sccs: finalizeOut.sccs,
     stats: finalizeOut.stats,

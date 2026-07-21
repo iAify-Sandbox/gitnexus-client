@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
@@ -52,7 +52,26 @@ describe('setupCommand skills integration', () => {
     await fs.rm(tempHome, { recursive: true, force: true });
   });
 
+  it('reports the OpenCode skills install path with the plural skills directory', async () => {
+    await fs.mkdir(path.join(tempHome, '.config', 'opencode'), { recursive: true });
+    await setupCommand();
+
+    const installedSkill = await fs.readFile(
+      path.join(tempHome, '.config', 'opencode', 'skills', 'gitnexus-cli', 'SKILL.md'),
+      'utf-8',
+    );
+
+    expect(installedSkill).toContain('GitNexus CLI Commands');
+    await expect(
+      fs.access(path.join(tempHome, '.config', 'opencode', 'skill', 'gitnexus-cli', 'SKILL.md')),
+    ).rejects.toThrow();
+  });
+
   it('installs packaged, flat-file, and directory skills into cursor skills directory', async () => {
+    const legacyReviewDir = path.join(tempHome, '.cursor', 'skills', 'gitnexus-pr-review');
+    await fs.mkdir(legacyReviewDir, { recursive: true });
+    await fs.writeFile(path.join(legacyReviewDir, 'SKILL.md'), 'legacy review skill', 'utf-8');
+
     await setupCommand();
 
     const cursorSkillsRoot = path.join(tempHome, '.cursor', 'skills');
@@ -67,6 +86,16 @@ describe('setupCommand skills integration', () => {
       'utf-8',
     );
     expect(skillContent).toContain('GitNexus CLI Commands');
+
+    const reviewContent = await fs.readFile(
+      path.join(cursorSkillsRoot, 'gitnexus-review', 'SKILL.md'),
+      'utf-8',
+    );
+    expect(reviewContent).toContain('name: gitnexus-review');
+    // The legacy directory survives the rename untouched: the installer cannot
+    // prove it owns the contents, so it warns instead of deleting (#2431 review).
+    const legacyContent = await fs.readFile(path.join(legacyReviewDir, 'SKILL.md'), 'utf-8');
+    expect(legacyContent).toBe('legacy review skill');
 
     // Flat file source should be installed as {name}/SKILL.md.
     const flatInstalled = await fs.readFile(
@@ -96,7 +125,7 @@ describe('setupCommand skills integration', () => {
 
     const codexConfig = await fs.readFile(path.join(tempHome, '.codex', 'config.toml'), 'utf-8');
     expect(codexConfig).toContain('[mcp_servers.gitnexus]');
-    expect(codexConfig).toContain('gitnexus@latest');
+    expect(codexConfig).toMatch(/gitnexus@\d+\.\d+\.\d+/);
 
     const codexSkill = await fs.readFile(
       path.join(tempHome, '.agents', 'skills', 'gitnexus-cli', 'SKILL.md'),
@@ -116,5 +145,48 @@ describe('setupCommand skills integration', () => {
     const sectionMatches = codexConfig.match(/\[mcp_servers\.gitnexus\]/g) ?? [];
 
     expect(sectionMatches).toHaveLength(1);
+  });
+
+  it('warns when a legacy renamed skill dir exists in a target, leaving it in place', async () => {
+    const legacyReviewDir = path.join(tempHome, '.cursor', 'skills', 'gitnexus-pr-review');
+    await fs.mkdir(legacyReviewDir, { recursive: true });
+    await fs.writeFile(
+      path.join(legacyReviewDir, 'SKILL.md'),
+      'customized legacy content',
+      'utf-8',
+    );
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await setupCommand();
+    const logged = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    logSpy.mockRestore();
+
+    expect(logged).toContain('skill "gitnexus-pr-review" was renamed to "gitnexus-review"');
+    // The warning pairs with non-destruction: the legacy dir survives untouched.
+    const legacyContent = await fs.readFile(path.join(legacyReviewDir, 'SKILL.md'), 'utf-8');
+    expect(legacyContent).toBe('customized legacy content');
+  });
+
+  it('does not warn about the rename when no legacy dir exists in any target', async () => {
+    // Earlier tests leave gitnexus-pr-review behind on purpose — clear it from
+    // every skill destination this suite can install into before asserting.
+    const targetRoots = [
+      path.join(tempHome, '.cursor', 'skills'),
+      path.join(tempHome, '.config', 'opencode', 'skills'),
+      path.join(tempHome, '.agents', 'skills'),
+      path.join(tempHome, '.claude', 'skills'),
+    ];
+    await Promise.all(
+      targetRoots.map((root) =>
+        fs.rm(path.join(root, 'gitnexus-pr-review'), { recursive: true, force: true }),
+      ),
+    );
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await setupCommand();
+    const logged = logSpy.mock.calls.map((call) => call.join(' ')).join('\n');
+    logSpy.mockRestore();
+
+    expect(logged).not.toContain('was renamed to');
   });
 });

@@ -1,50 +1,111 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  searchFTSFromLbug,
-  invalidateEnsuredFTSForRepo,
-  type BM25SearchResult,
-} from '../../src/core/search/bm25-index.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { searchFTSFromLbug, type BM25SearchResult } from '../../src/core/search/bm25-index.js';
+import { FTS_INDEXES } from '../../src/core/search/fts-schema.js';
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/lbug/lbug-adapter.js')>();
   return {
     ...actual,
     queryFTS: vi.fn().mockResolvedValue([]),
+    createFTSIndex: vi.fn().mockResolvedValue(undefined),
+    dropFTSIndex: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 // Pool adapter is dynamically imported by the MCP-pool path of
-// `searchFTSFromLbug`. We mock it so we can drive the executor and the
-// pool-close listener without spinning up a real LadybugDB pool.
-const poolCloseListeners: Array<(repoId: string) => void> = [];
-const mockExecuteQuery = vi.fn();
+// `searchFTSFromLbug`. We mock it so we can drive the executor without
+// spinning up a real LadybugDB pool.
+const mockExecuteParameterized = vi.fn();
 vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
-  executeQuery: (repoId: string, cypher: string) => mockExecuteQuery(repoId, cypher),
-  addPoolCloseListener: (listener: (repoId: string) => void) => {
-    poolCloseListeners.push(listener);
-    return () => {
-      const idx = poolCloseListeners.indexOf(listener);
-      if (idx !== -1) poolCloseListeners.splice(idx, 1);
-    };
-  },
+  executeParameterized: (repoId: string, cypher: string, params: Record<string, any>) =>
+    mockExecuteParameterized(repoId, cypher, params),
+  addPoolCloseListener: vi.fn(),
 }));
 
 describe('BM25 search', () => {
+  describe('createSearchFTSIndexes', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it('creates every configured index on the writable analysis path', async () => {
+      const { createFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      const { createSearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      await createSearchFTSIndexes();
+
+      expect(vi.mocked(createFTSIndex).mock.calls).toEqual(
+        FTS_INDEXES.map((i) => [i.table, i.indexName, [...i.properties], 'porter']),
+      );
+    });
+
+    it('returns no missing indexes when every configured index covers its columns', async () => {
+      // One SHOW_INDEXES call returns a catalog row per configured index, each
+      // covering exactly its expected properties.
+      const showIndexesRows = FTS_INDEXES.map((i) => ({
+        index_name: i.indexName,
+        property_names: [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual([]);
+      expect(executeQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports an index that exists but does not cover its configured columns', async () => {
+      // Model a pre-#2299 stale Function index: present, but name+content only,
+      // missing `description`. Every other index covers its columns.
+      const staleIndex = 'function_fts';
+      const showIndexesRows = FTS_INDEXES.map((i) => ({
+        index_name: i.indexName,
+        property_names: i.indexName === staleIndex ? ['name', 'content'] : [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual(['Function.function_fts']);
+    });
+
+    it('reports an index that is absent from the catalog entirely', async () => {
+      // Every configured index present and covering, except const_fts is missing.
+      const absentIndex = 'const_fts';
+      const showIndexesRows = FTS_INDEXES.filter((i) => i.indexName !== absentIndex).map((i) => ({
+        index_name: i.indexName,
+        property_names: [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual(['Const.const_fts']);
+    });
+  });
+
   describe('searchFTSFromLbug', () => {
-    it('returns empty array when LadybugDB is not initialized', async () => {
-      // Without LadybugDB init, search should return empty (not crash)
-      const results = await searchFTSFromLbug('test query');
+    it('returns empty results when LadybugDB is not initialized', async () => {
+      // Simulate an uninitialized DB: queryFTS throws instead of returning rows
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockRejectedValue(new Error('DB not initialized'));
+
+      const { results, ftsAvailable } = await searchFTSFromLbug('test query');
       expect(Array.isArray(results)).toBe(true);
       expect(results).toHaveLength(0);
+      expect(ftsAvailable).toBe(false);
     });
 
     it('handles empty query', async () => {
-      const results = await searchFTSFromLbug('');
+      const { results } = await searchFTSFromLbug('');
       expect(Array.isArray(results)).toBe(true);
     });
 
     it('accepts custom limit parameter', async () => {
-      const results = await searchFTSFromLbug('test', 5);
+      const { results } = await searchFTSFromLbug('test', 5);
       expect(Array.isArray(results)).toBe(true);
     });
   });
@@ -94,7 +155,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const results = await searchFTSFromLbug('queryset');
+      const { results } = await searchFTSFromLbug('queryset');
 
       expect(results).toHaveLength(1);
       expect(results[0].filePath).toBe('src/views.py');
@@ -116,7 +177,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const results = await searchFTSFromLbug('model');
+      const { results } = await searchFTSFromLbug('model');
 
       expect(results).toHaveLength(1);
       expect(results[0].score).toBe(8); // 5+3
@@ -136,7 +197,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const results = await searchFTSFromLbug('util');
+      const { results } = await searchFTSFromLbug('util');
 
       expect(results).toHaveLength(1);
       expect(results[0].nodeIds).toEqual([]);
@@ -160,7 +221,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const results = await searchFTSFromLbug('auth');
+      const { results } = await searchFTSFromLbug('auth');
 
       expect(results).toHaveLength(1);
       // All 3 hits (scores 9+7+4=20) — each from a different table, all top-3
@@ -181,7 +242,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const results = await searchFTSFromLbug('fn');
+      const { results } = await searchFTSFromLbug('fn');
 
       expect(results[0].filePath).toBe('src/high.py');
       expect(results[1].filePath).toBe('src/low.py');
@@ -190,125 +251,220 @@ describe('BM25 search', () => {
     });
   });
 
-  describe('ensureFTS cache (MCP pool path)', () => {
-    const REPO = 'test-repo-fts-cache';
+  describe('MCP pool path', () => {
+    const REPO = 'test-repo-readonly-fts';
 
     beforeEach(() => {
-      // Clean state so cases don't bleed into each other.
-      mockExecuteQuery.mockReset();
-      invalidateEnsuredFTSForRepo(REPO);
-      // Suppress the surfaced warn so test output stays readable.
-      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      mockExecuteParameterized.mockReset();
     });
 
-    it('does NOT cache a transient CREATE_FTS_INDEX failure — second call retries', async () => {
-      // First call: every CREATE_FTS_INDEX fails transiently; QUERY_FTS_INDEX returns nothing.
-      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
-        if (cypher.includes('CREATE_FTS_INDEX')) {
-          throw new Error('transient lock error: Could not set lock');
-        }
-        return [];
-      });
+    it('queries existing FTS indexes without issuing CREATE_FTS_INDEX', async () => {
+      mockExecuteParameterized.mockImplementation(
+        async (_repo: string, cypher: string, params: Record<string, any>) => {
+          if (cypher.includes('CREATE_FTS_INDEX')) {
+            throw new Error('query path must stay read-only');
+          }
 
-      const r1 = await searchFTSFromLbug('anything', 5, REPO);
-      expect(Array.isArray(r1)).toBe(true);
+          if (params.query === 'login' && cypher.includes("QUERY_FTS_INDEX('Function'")) {
+            return [{ node: { filePath: 'src/auth.ts', id: 'func:login' }, score: 8 }];
+          }
+          return [];
+        },
+      );
 
-      const createCallsAfterFirst = mockExecuteQuery.mock.calls.filter((c) =>
-        String(c[1]).includes('CREATE_FTS_INDEX'),
-      ).length;
-      // 5 FTS index tables — all five attempted on first call.
-      expect(createCallsAfterFirst).toBe(5);
+      const { results } = await searchFTSFromLbug('login', 5, REPO);
 
-      // Second call: CREATE succeeds this time. The bug being fixed: if the
-      // first failure was cached, we'd see ZERO additional CREATE calls.
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
-
-      await searchFTSFromLbug('anything', 5, REPO);
-
-      const createCallsOnRetry = mockExecuteQuery.mock.calls.filter((c) =>
-        String(c[1]).includes('CREATE_FTS_INDEX'),
-      ).length;
-      expect(createCallsOnRetry).toBe(5);
-    });
-
-    it("treats 'already exists' as success and caches it (no retry on second call)", async () => {
-      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
-        if (cypher.includes('CREATE_FTS_INDEX')) {
-          throw new Error("Catalog exception: index 'file_fts' already exists");
-        }
-        return [];
-      });
-
-      await searchFTSFromLbug('anything', 5, REPO);
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
-
-      await searchFTSFromLbug('anything', 5, REPO);
-
-      const createCallsOnSecond = mockExecuteQuery.mock.calls.filter((c) =>
-        String(c[1]).includes('CREATE_FTS_INDEX'),
-      ).length;
-      expect(createCallsOnSecond).toBe(0);
-    });
-
-    it('invalidateEnsuredFTSForRepo drops cached entries so next call re-issues CREATE', async () => {
-      // Prime the cache with successful creates.
-      mockExecuteQuery.mockResolvedValue([]);
-      await searchFTSFromLbug('anything', 5, REPO);
-
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
-
-      // Without invalidation: no re-CREATE.
-      await searchFTSFromLbug('anything', 5, REPO);
+      expect(results).toEqual([
+        { filePath: 'src/auth.ts', score: 8, rank: 1, nodeIds: ['func:login'] },
+      ]);
       expect(
-        mockExecuteQuery.mock.calls.filter((c) => String(c[1]).includes('CREATE_FTS_INDEX')).length,
-      ).toBe(0);
-
-      // After invalidation: next call re-issues CREATE for all 5 tables.
-      invalidateEnsuredFTSForRepo(REPO);
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
-      await searchFTSFromLbug('anything', 5, REPO);
-      expect(
-        mockExecuteQuery.mock.calls.filter((c) => String(c[1]).includes('CREATE_FTS_INDEX')).length,
-      ).toBe(5);
+        mockExecuteParameterized.mock.calls.some((c) => String(c[1]).includes('CREATE_FTS_INDEX')),
+      ).toBe(false);
     });
 
-    it('a pool-close listener fired by the pool adapter invalidates this repo only', async () => {
-      const OTHER = 'other-repo';
+    it('binds FTS user query text as a parameter in pool mode', async () => {
+      mockExecuteParameterized.mockResolvedValue([]);
 
-      mockExecuteQuery.mockResolvedValue([]);
-      // Prime both repos.
+      const userQuery = "BrowserWindow create delete set remove 'main' window";
+      await searchFTSFromLbug(userQuery, 5, REPO);
+
+      expect(mockExecuteParameterized).toHaveBeenCalled();
+      for (const call of mockExecuteParameterized.mock.calls) {
+        const cypher = String(call[1]);
+        expect(cypher).toContain('$query');
+        expect(cypher).not.toContain(userQuery);
+        expect(cypher.toUpperCase()).not.toMatch(/\bCREATE\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bDELETE\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bSET\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bREMOVE\b/);
+        expect(call[2]).toEqual({ query: userQuery });
+      }
+    });
+
+    it('uses the configured FTS query set on every call', async () => {
+      mockExecuteParameterized.mockResolvedValue([]);
+
       await searchFTSFromLbug('anything', 5, REPO);
-      await searchFTSFromLbug('anything', 5, OTHER);
 
-      // Confirm at least one listener was registered by the search module.
-      expect(poolCloseListeners.length).toBeGreaterThanOrEqual(1);
+      const queryCalls = mockExecuteParameterized.mock.calls.filter((c) =>
+        String(c[1]).includes('QUERY_FTS_INDEX'),
+      );
+      expect(queryCalls.map((c) => String(c[1]).match(/QUERY_FTS_INDEX\('([^']+)'/)?.[1])).toEqual(
+        FTS_INDEXES.map((i) => i.table),
+      );
+    });
+  });
 
-      // Simulate the pool adapter closing REPO.
-      for (const l of poolCloseListeners) l(REPO);
+  describe('GITNEXUS_FTS_CJK_SEGMENTATION query-side transform (#2331)', () => {
+    const CJK_REPO = 'test-repo-cjk-query';
 
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
 
-      await searchFTSFromLbug('anything', 5, REPO);
-      const createForRepo = mockExecuteQuery.mock.calls.filter(
-        (c) => c[0] === REPO && String(c[1]).includes('CREATE_FTS_INDEX'),
-      ).length;
-      expect(createForRepo).toBe(5);
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
 
-      // OTHER repo's cache must remain intact — no re-CREATE for it.
-      mockExecuteQuery.mockReset();
-      mockExecuteQuery.mockResolvedValue([]);
-      await searchFTSFromLbug('anything', 5, OTHER);
-      const createForOther = mockExecuteQuery.mock.calls.filter(
-        (c) => c[0] === OTHER && String(c[1]).includes('CREATE_FTS_INDEX'),
-      ).length;
-      expect(createForOther).toBe(0);
+    it('leaves the query unchanged by default (mode: none)', async () => {
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
 
-      invalidateEnsuredFTSForRepo(OTHER);
+      await searchFTSFromLbug('审批流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批流程');
+      }
+    });
+
+    it('bigram-segments the query before it reaches queryFTS when enabled', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批 批流 流程');
+      }
+    });
+
+    it('bigram-segments the query in pool mode too, still bound via $query', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      mockExecuteParameterized.mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程', 5, CJK_REPO);
+
+      expect(mockExecuteParameterized).toHaveBeenCalled();
+      for (const call of mockExecuteParameterized.mock.calls) {
+        expect(String(call[1])).toContain('$query');
+        expect(String(call[1])).not.toContain('审批流程');
+        expect(call[2]).toEqual({ query: '审批 批流 流程' });
+      }
+    });
+
+    it('skips segmentation for a pathologically long query, searching it unchanged', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const longQuery = '审批流程'.repeat(1000); // well past the 2000-char cap
+      await searchFTSFromLbug(longQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe(longQuery);
+      }
+    });
+
+    it('segments a query at exactly the 2000-character cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const atCapQuery = '审'.repeat(2000);
+      await searchFTSFromLbug(atCapQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).not.toBe(atCapQuery); // segmented, not passed through raw
+        expect(call[2]).toContain(' ');
+      }
+    });
+
+    it('does not segment a query at exactly 2001 characters, one past the cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const overCapQuery = '审'.repeat(2001);
+      await searchFTSFromLbug(overCapQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe(overCapQuery); // passed through raw, unsegmented
+      }
+    });
+  });
+
+  // #2339: the query path previously never called normalizeFtsText (only
+  // applyCjkSegmentationIfEnabled), unlike the write path which always
+  // composes both — a literal tab/newline in a query wouldn't match
+  // whitespace-normalized indexed text.
+  describe('normalizeFtsText query-side composition (#2339)', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('collapses a literal tab in the query to a space (mode: none)', async () => {
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批\t流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批 流程');
+      }
+    });
+
+    it('composes segmentation THEN normalization, matching the write path order (mode: bigram)', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程\t自动');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        // "审批流程" bigram-segments to "审批 批流 流程"; the tab (untouched
+        // by segmentCjkSpans, since neither run's boundary needs an extra
+        // space next to an already-whitespace neighbor) is then collapsed
+        // to a space by normalizeFtsText, keeping "自动" a separate token.
+        expect(call[2]).toBe('审批 批流 流程 自动');
+      }
+    });
+
+    it('applies normalization regardless of the 2000-char segmentation cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const longQueryWithTab = '审'.repeat(2001) + '\t' + '批';
+      await searchFTSFromLbug(longQueryWithTab);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        // Segmentation is skipped (over the cap), but normalizeFtsText still
+        // runs unconditionally — no per-character cost concern there.
+        expect(call[2]).toBe('审'.repeat(2001) + ' ' + '批');
+      }
     });
   });
 });
